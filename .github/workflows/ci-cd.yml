@@ -1,0 +1,206 @@
+name: CI/CD - Build, Push y Deploy a EKS
+
+# Se dispara con cada push a main (a la carpeta del proyecto)
+# y tambien puede ejecutarse manualmente desde la pestana Actions.
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'proyecto semestral/**'
+  workflow_dispatch: {}
+
+env:
+  AWS_REGION: us-east-1
+  CLUSTER_NAME: proyecto-semestral-eks
+  PROJECT_DIR: "proyecto semestral"
+  ECR_BACKEND_VENTAS: proyecto-semestral-backend-ventas
+  ECR_BACKEND_DESPACHO: proyecto-semestral-backend-despacho
+  ECR_FRONTEND: proyecto-semestral-frontend
+  NAMESPACE: proyecto-semestral
+
+jobs:
+  # ------------------------------------------------------------------
+  # 1) Build & push de los backends (Spring Boot) hacia Amazon ECR
+  # ------------------------------------------------------------------
+  build-backends:
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.vars.outputs.image_tag }}
+    steps:
+      - name: Checkout codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS (AWS Academy)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Definir tag de la imagen
+        id: vars
+        run: echo "image_tag=${GITHUB_SHA::8}" >> "$GITHUB_OUTPUT"
+
+      - name: Build & push backend-despacho
+        uses: docker/build-push-action@v5
+        with:
+          context: "${{ env.PROJECT_DIR }}/back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO"
+          file: "${{ env.PROJECT_DIR }}/back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO/Dockerfile"
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_DESPACHO }}:${{ steps.vars.outputs.image_tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_DESPACHO }}:latest
+
+      - name: Build & push backend-ventas
+        uses: docker/build-push-action@v5
+        with:
+          context: "${{ env.PROJECT_DIR }}/back-Ventas_SpringBoot/Springboot-API-REST"
+          file: "${{ env.PROJECT_DIR }}/back-Ventas_SpringBoot/Springboot-API-REST/Dockerfile"
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_VENTAS }}:${{ steps.vars.outputs.image_tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_VENTAS }}:latest
+
+  # ------------------------------------------------------------------
+  # 2) Deploy de MySQL + Backends al cluster EKS
+  # ------------------------------------------------------------------
+  deploy-backends:
+    needs: build-backends
+    runs-on: ubuntu-latest
+    outputs:
+      ventas_url: ${{ steps.urls.outputs.ventas_url }}
+      despacho_url: ${{ steps.urls.outputs.despacho_url }}
+    steps:
+      - name: Checkout codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Actualizar kubeconfig (EKS)
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Aplicar namespace y bases de datos MySQL
+        run: |
+          kubectl apply -f "infra/k8s/00-namespace.yaml"
+          kubectl apply -f "infra/k8s/01-mysql-ventas.yaml"
+          kubectl apply -f "infra/k8s/02-mysql-despacho.yaml"
+
+      - name: Desplegar backend-despacho y backend-ventas
+        env:
+          TAG: ${{ needs.build-backends.outputs.image_tag }}
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          sed -e "s#REPLACE_ECR_BACKEND_DESPACHO#${REGISTRY}/${ECR_BACKEND_DESPACHO}#g" \
+              -e "s#REPLACE_TAG#${TAG}#g" \
+              infra/k8s/04-backend-despacho.yaml | kubectl apply -f -
+
+          sed -e "s#REPLACE_ECR_BACKEND_VENTAS#${REGISTRY}/${ECR_BACKEND_VENTAS}#g" \
+              -e "s#REPLACE_TAG#${TAG}#g" \
+              infra/k8s/03-backend-ventas.yaml | kubectl apply -f -
+
+      - name: Esperar rollout de los backends
+        run: |
+          kubectl rollout status deployment/backend-despacho -n "$NAMESPACE" --timeout=300s
+          kubectl rollout status deployment/backend-ventas   -n "$NAMESPACE" --timeout=300s
+
+      - name: Esperar Load Balancers publicos de los backends
+        id: urls
+        run: |
+          echo "Esperando hostname del ELB de backend-despacho..."
+          for i in $(seq 1 30); do
+            HOST=$(kubectl get svc backend-despacho -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -n "$HOST" ]; then break; fi
+            sleep 10
+          done
+          DESPACHO_URL="http://${HOST}:8081"
+          echo "Backend Despacho -> $DESPACHO_URL"
+
+          echo "Esperando hostname del ELB de backend-ventas..."
+          for i in $(seq 1 30); do
+            HOST2=$(kubectl get svc backend-ventas -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -n "$HOST2" ]; then break; fi
+            sleep 10
+          done
+          VENTAS_URL="http://${HOST2}:8082"
+          echo "Backend Ventas -> $VENTAS_URL"
+
+          echo "despacho_url=${DESPACHO_URL}" >> "$GITHUB_OUTPUT"
+          echo "ventas_url=${VENTAS_URL}" >> "$GITHUB_OUTPUT"
+
+  # ------------------------------------------------------------------
+  # 3) Build & deploy del Frontend (apuntando a los backends publicos)
+  # ------------------------------------------------------------------
+  build-deploy-frontend:
+    needs: [build-backends, deploy-backends]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codigo
+        uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login en Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Actualizar kubeconfig (EKS)
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Build & push frontend (con URLs de los backends)
+        uses: docker/build-push-action@v5
+        with:
+          context: "${{ env.PROJECT_DIR }}/front_despacho"
+          file: "${{ env.PROJECT_DIR }}/front_despacho/Dockerfile"
+          push: true
+          build-args: |
+            VITE_API_DESPACHO_URL=${{ needs.deploy-backends.outputs.despacho_url }}
+            VITE_API_VENTAS_URL=${{ needs.deploy-backends.outputs.ventas_url }}
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_FRONTEND }}:${{ needs.build-backends.outputs.image_tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_FRONTEND }}:latest
+
+      - name: Desplegar frontend en EKS
+        env:
+          TAG: ${{ needs.build-backends.outputs.image_tag }}
+          REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          sed -e "s#REPLACE_ECR_FRONTEND#${REGISTRY}/${ECR_FRONTEND}#g" \
+              -e "s#REPLACE_TAG#${TAG}#g" \
+              infra/k8s/05-frontend.yaml | kubectl apply -f -
+
+          kubectl rollout status deployment/frontend -n "$NAMESPACE" --timeout=300s
+
+      - name: Obtener URL publica del Frontend
+        run: |
+          echo "Esperando hostname del ELB del frontend..."
+          for i in $(seq 1 30); do
+            HOST=$(kubectl get svc frontend -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            if [ -n "$HOST" ]; then break; fi
+            sleep 10
+          done
+          echo "=================================================="
+          echo " Frontend disponible en: http://${HOST}"
+          echo " Backend Despacho:       ${{ needs.deploy-backends.outputs.despacho_url }}"
+          echo " Backend Ventas:         ${{ needs.deploy-backends.outputs.ventas_url }}"
+          echo "=================================================="
