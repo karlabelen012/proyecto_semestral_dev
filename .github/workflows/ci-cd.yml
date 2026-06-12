@@ -1,18 +1,13 @@
 name: CI/CD - Build, Push y Deploy a EKS
 
-# Se dispara con cada push a main (a la carpeta del proyecto)
-# y tambien puede ejecutarse manualmente desde la pestana Actions.
 on:
   push:
-    branches: [ main ]
-    paths:
-      - 'proyecto semestral/**'
+    branches: [ master ]
   workflow_dispatch: {}
 
 env:
   AWS_REGION: us-east-1
   CLUSTER_NAME: proyecto-semestral-eks
-  PROJECT_DIR: "proyecto semestral"
   ECR_BACKEND_VENTAS: proyecto-semestral-backend-ventas
   ECR_BACKEND_DESPACHO: proyecto-semestral-backend-despacho
   ECR_FRONTEND: proyecto-semestral-frontend
@@ -49,8 +44,8 @@ jobs:
       - name: Build & push backend-despacho
         uses: docker/build-push-action@v5
         with:
-          context: "${{ env.PROJECT_DIR }}/back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO"
-          file: "${{ env.PROJECT_DIR }}/back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO/Dockerfile"
+          context: "back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO"
+          file: "back-Despachos_SpringBoot/Springboot-API-REST-DESPACHO/Dockerfile"
           push: true
           tags: |
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_DESPACHO }}:${{ steps.vars.outputs.image_tag }}
@@ -59,8 +54,8 @@ jobs:
       - name: Build & push backend-ventas
         uses: docker/build-push-action@v5
         with:
-          context: "${{ env.PROJECT_DIR }}/back-Ventas_SpringBoot/Springboot-API-REST"
-          file: "${{ env.PROJECT_DIR }}/back-Ventas_SpringBoot/Springboot-API-REST/Dockerfile"
+          context: "back-Ventas_SpringBoot/Springboot-API-REST"
+          file: "back-Ventas_SpringBoot/Springboot-API-REST/Dockerfile"
           push: true
           tags: |
             ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_BACKEND_VENTAS }}:${{ steps.vars.outputs.image_tag }}
@@ -170,8 +165,8 @@ jobs:
       - name: Build & push frontend (con URLs de los backends)
         uses: docker/build-push-action@v5
         with:
-          context: "${{ env.PROJECT_DIR }}/front_despacho"
-          file: "${{ env.PROJECT_DIR }}/front_despacho/Dockerfile"
+          context: "front_despacho"
+          file: "front_despacho/Dockerfile"
           push: true
           build-args: |
             VITE_API_DESPACHO_URL=${{ needs.deploy-backends.outputs.despacho_url }}

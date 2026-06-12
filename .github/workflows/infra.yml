@@ -16,7 +16,7 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  TF_DIR: "proyecto semestral/infra/terraform"
+  TF_DIR: "infra/terraform"
 
 jobs:
   terraform:
